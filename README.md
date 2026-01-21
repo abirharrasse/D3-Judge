@@ -120,9 +120,9 @@ data/
 ## Citation
 
 ```bibtex
-@misc{harrasse2025debatedeliberatedecided3,
+@misc{bandi2025debatedeliberatedecided3,
       title={Debate, Deliberate, Decide (D3): A Cost-Aware Adversarial Framework for Reliable and Interpretable LLM Evaluation}, 
-      author={Abir Harrasse and Chaithanya Bandi and Hari Bandi},
+      author={Chaithanya Bandi and Abir Harrasse},
       year={2025},
       eprint={2410.04663},
       archivePrefix={arXiv},
