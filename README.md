@@ -17,10 +17,6 @@ D3 addresses this gap through a **courtroom-inspired multi-agent framework** whe
 Validated across MT-Bench, AlignBench, and AUTO-J, D3 achieves 86.3% accuracy—a 12.6% absolute improvement over single-judge evaluation and 6.9% over the best existing framework—while providing full interpretability through debate transcripts and reasoned jury verdicts.
 
 
-
-Run the preprocessing with:
-```bash
-python data/preprocess_mt_bench.py
 ```
 ## Installation and Setup
 
