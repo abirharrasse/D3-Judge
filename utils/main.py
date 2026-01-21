@@ -179,7 +179,6 @@ try:
     with open(json_file_path, 'r') as file:
         existing_data = json.load(file)
 except FileNotFoundError:
-    # If file doesn't exist, start with an empty dictionary
     existing_data = {}
 
 existing_data.update(results)

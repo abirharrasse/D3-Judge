@@ -1,7 +1,7 @@
 import asyncio
 import nest_asyncio
 import platform
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import re
 from metagpt.actions import Action
 from metagpt.logs import logger
@@ -10,7 +10,12 @@ from metagpt.schema import Message
 from metagpt.team import Team
 import argparse
 
-print("Starting debate script...")
+# D3 Framework enhancements
+from convergence import BudgetedStoppingController, BudgetConfig
+from anonymizer import TranscriptBuilder, anonymize_transcript
+from token_tracker import TokenTracker
+
+print("Starting debate script with D3 enhancements...")
 
 # Global variables for debate content
 
@@ -255,16 +260,100 @@ class Scorer(Role):
         self.rc.memory.add(msg)
         return msg
 
-async def debate(question:str, answer1:str, answer2:str, investment: float = 3.0, n_round: int = 5, n_advocates: int = 3) -> List[str]:
-    print("Initializing debate...")
+
+# ==================== JURY SUPPORT FOR MORE ====================
+# Per D3 paper Figure 1: Jury is used in both protocols
+
+class VoteAction(Action):
+    """Jury voting action - adapted from SAMRE for MORE protocol."""
+    name: str = "VoteAction"
+
+    async def run(self, question: str, context: str, identity: str) -> str:
+        prompt = f"""As a jury member with the identity of {identity}, you are observing a debate on the question: {question}
+        This is the debate:
+        {context}
+        
+        Based on the arguments presented and taking into account the judge's evaluation (but not being overly influenced by it),
+        which defense do you think presented a more convincing case? Explain your reasoning briefly and conclude with your vote.
+        
+        Your response should be in the format:
+        Reasoning: [Your brief explanation]
+        Vote: (1, 0) if you vote for Defense A, or (0, 1) if you vote for Defense B
+        """
+        return await self._aask(prompt)
+
+
+class Jury(Role):
+    """Jury role for MORE protocol with persona-based evaluation."""
+    
+    def __init__(self, name: str, identity: str, question: str, **kwargs):
+        super().__init__(**kwargs)
+        self.name = name
+        self.identity = identity
+        self.question = question
+        self.vote_action = VoteAction()
+        self.set_actions([self.vote_action])
+        self._watch([AggregateDefense, ScoreAnswer])
+
+    async def _act(self, transcript: str) -> Message:
+        logger.info(f"{self.name} ({self.identity}): Evaluating and voting")
+        
+        vote = await self.vote_action.run(
+            question=self.question,
+            context=transcript,
+            identity=self.identity
+        )
+
+        msg = Message(content=vote, role=self.name, cause_by=VoteAction)
+        self.rc.memory.add(msg)
+        return msg
+
+async def debate(
+    question: str, 
+    answer1: str, 
+    answer2: str, 
+    investment: float = 3.0, 
+    n_round: int = 5, 
+    n_advocates: int = 3,
+    n_juries: int = 5
+) -> Tuple[List[str], Tuple[int, int], dict]:
+    """
+    MORE debate with D3 framework features:
+    - Multi-advocate groups with aggregation
+    - Jury deliberation with anonymized transcripts
+    - Token tracking
+    
+    Returns:
+        Tuple of (scores_list, jury_votes, stats_dict)
+    """
+    print("Initializing MORE debate with D3 framework...")
+    
+    # Initialize D3 components
+    transcript_builder = TranscriptBuilder(question, answer1, answer2)
+    token_tracker = TokenTracker()
+    
     advocate_group1 = AdvocateGroup(name="AdvocateGroup1", question=question, answer=answer1, opponent_answer=answer2, n_advocates=n_advocates)
     advocate_group2 = AdvocateGroup(name="AdvocateGroup2", question=question, answer=answer2, opponent_answer=answer1, n_advocates=n_advocates)
     judge = Judge(question=question, answer1=answer1, answer2=answer2)
     scorer = Scorer(question=question, answer1=answer1, answer2=answer2)
+    
+    # Initialize juries with diverse personas (per D3 paper)
+    jury_identities = [
+        "A retired professor of ethics",
+        "A young environmental activist",
+        "A middle-aged business owner",
+        "A social worker specializing in community development",
+        "A technology entrepreneur with a background in AI"
+    ]
+    juries = [
+        Jury(name=f"Jury{i+1}", identity=jury_identities[i % len(jury_identities)], question=question)
+        for i in range(n_juries)
+    ]
 
     print(f"Debate Question: {question}")
-    print(f"AdvocateGroup1 defends: {answer1}")
-    print(f"AdvocateGroup2 defends: {answer2}\n")
+    print(f"AdvocateGroup1 ({n_advocates} advocates) defends: {answer1}")
+    print(f"AdvocateGroup2 ({n_advocates} advocates) defends: {answer2}")
+    print(f"Number of juries: {n_juries}\n")
 
     initial_msg = Message(content=question, role="Human", cause_by=DefendAnswer)
     for adv in advocate_group1.advocates + advocate_group2.advocates:
@@ -274,11 +363,13 @@ async def debate(question:str, answer1:str, answer2:str, investment: float = 3.0
     scores = []
 
     for i in range(n_round):
+        token_tracker.set_round(i + 1)
         print(f"Starting Round {i+1}...")
 
         print("AdvocateGroup1 preparing argument...")
         msg1 = await advocate_group1.act()
-        print(f"AdvocateGroup1 aggregated argument: {msg1}")
+        print(f"AdvocateGroup1 aggregated argument: {msg1[:100]}...")
+        transcript_builder.add_argument("AdvocateGroup1", msg1)
         for adv in advocate_group2.advocates:
             adv.rc.memory.add(Message(content=msg1, role=f"Opponent of {adv.name}", cause_by=AggregateDefense))
         judge.rc.memory.add(Message(content=msg1, role="AdvocateGroup1"))
@@ -286,7 +377,8 @@ async def debate(question:str, answer1:str, answer2:str, investment: float = 3.0
 
         print("AdvocateGroup2 preparing argument...")
         msg2 = await advocate_group2.act()
-        print(f"AdvocateGroup2 aggregated argument: {msg2}")
+        print(f"AdvocateGroup2 aggregated argument: {msg2[:100]}...")
+        transcript_builder.add_argument("AdvocateGroup2", msg2)
         for adv in advocate_group1.advocates:
             adv.rc.memory.add(Message(content=msg2, role=f"Opponent of {adv.name}", cause_by=AggregateDefense))
         judge.rc.memory.add(Message(content=msg2, role="AdvocateGroup2"))
@@ -294,7 +386,7 @@ async def debate(question:str, answer1:str, answer2:str, investment: float = 3.0
 
         print("Judge evaluating...")
         judge_msg = await judge._act(current_round=i+1, total_rounds=n_round, previous_scores=previous_scores)
-        print(f"Judge evaluation: {judge_msg.content}")
+        print(f"Judge evaluation: {judge_msg.content[:100]}...")
         for adv in advocate_group1.advocates + advocate_group2.advocates:
             adv.rc.memory.add(judge_msg)
         advocate_group1.aggregator.rc.memory.add(judge_msg)
@@ -311,35 +403,114 @@ async def debate(question:str, answer1:str, answer2:str, investment: float = 3.0
             if not isinstance(new_scores, tuple) or len(new_scores) != 2:
                 raise ValueError("Invalid score format")
             previous_scores.append(new_scores)
+            transcript_builder.add_judge_round(judge_msg.content, new_scores)
             print(f"Parsed Scores: {new_scores}")
         except Exception as e:
-                    print(f"Error parsing scores: {e}")
-                    previous_scores.append((0, 0))  # Default scores if parsing fails
+            print(f"Error parsing scores: {e}")
+            previous_scores.append((0, 0))
 
         print()  # Add a blank line between rounds
 
+    # Compile ANONYMIZED transcript for jury deliberation
+    print("\nCompiling anonymized transcript for jury deliberation...")
+    anonymized_transcript = transcript_builder.build_anonymized()
+    print(f"Transcript compiled ({len(anonymized_transcript)} chars)")
+    
+    # Jury voting (NEW for MORE protocol - per D3 paper Figure 1)
+    print("\nJury voting...")
+    jury_votes = [0, 0]
+    jury_votes_list = []
+    
+    # Extract tuple from vote response
+    def get_vote_tuple(response):
+        all_matches = re.findall(r'[\(\[]([01]),\s*([01])[\)\]]', response)
+        if all_matches:
+            last_match = all_matches[-1]
+            return (int(last_match[0]), int(last_match[1]))
+        return None
+    
+    for jury in juries:
+        jury_vote = await jury._act(anonymized_transcript)
+        vote_tuple = get_vote_tuple(jury_vote.content)
+        parsed_vote = vote_tuple if vote_tuple else (0, 0)
+        jury_votes_list.append(parsed_vote)
+        print(f"{jury.name} ({jury.identity}) vote: {parsed_vote}")
+        jury_votes[0] += parsed_vote[0]
+        jury_votes[1] += parsed_vote[1]
+
     # Print final scores
-    print("Final Scores:") 
+    print("\nFinal Judge Scores:") 
     for round_num, (score1, score2) in enumerate(previous_scores, 1):
-        print(f"Round {round_num}: AdvocateGroup1 - {score1}, AdvocateGroup2 - {score2}")
+        print(f"Round {round_num}: Defense A - {score1}, Defense B - {score2}")
+    
+    # Determine winners
+    final_scores = previous_scores[-1] if previous_scores else (0, 0)
+    judge_winner = "Defense A" if final_scores[0] > final_scores[1] else "Defense B"
+    jury_winner = "Defense A" if jury_votes[0] > jury_votes[1] else "Defense B"
+    
+    print(f"\nJury Votes: Defense A: {jury_votes[0]}, Defense B: {jury_votes[1]}")
+    print(f"Judge's Winner: {judge_winner}")
+    print(f"Jury's Winner: {jury_winner}")
 
-    print("Debate completed.")
-    return scores
+    print("\nDebate completed.")
+    
+    # Compile statistics
+    stats = {
+        "rounds_completed": n_round,
+        "n_advocates": n_advocates,
+        "n_juries": n_juries,
+        "judge_final_scores": final_scores,
+        "jury_votes": tuple(jury_votes),
+        "jury_winner": jury_winner,
+        "judge_winner": judge_winner,
+        "token_usage": token_tracker.get_summary()
+    }
+    
+    return scores, tuple(jury_votes), stats
 
-async def run_debate(question: str, answer1: str, answer2: str, investment: float = 0.1, n_round: int = 3, n_advocates: int = 3) -> List[str]:
+async def run_debate(
+    question: str, 
+    answer1: str, 
+    answer2: str, 
+    investment: float = 0.1, 
+    n_round: int = 3, 
+    n_advocates: int = 3,
+    n_juries: int = 5
+) -> Tuple[List[str], Tuple[int, int], dict]:
+    """Run a MORE debate with D3 framework enhancements."""
     try:
-        print("Starting run_debate function...")
-        scores = await debate(question=question, answer1=answer1, answer2=answer2, investment=investment, n_round=n_round, n_advocates=n_advocates)
+        print("Starting run_debate function with D3 enhancements...")
+        scores, jury_votes, stats = await debate(
+            question=question, 
+            answer1=answer1, 
+            answer2=answer2, 
+            investment=investment, 
+            n_round=n_round, 
+            n_advocates=n_advocates,
+            n_juries=n_juries
+        )
         print("Debate completed successfully.")
-        return scores
+        print(f"Stats: {stats}")
+        return scores, jury_votes, stats
     except Exception as e:
         print(f"An error occurred during the debate: {str(e)}")
         import traceback
         traceback.print_exc()
-        return []  # Return an empty list instead of raising an exception
+        return [], (0, 0), {"error": str(e)}
 
 nest_asyncio.apply()
 
-def more_scores(question: str, answer1: str, answer2: str, investment: float = 0.1, n_round: int = 3, n_advocates: int = 3) -> List[str]:
+def more_scores(
+    question: str, 
+    answer1: str, 
+    answer2: str, 
+    investment: float = 0.1, 
+    n_round: int = 3, 
+    n_advocates: int = 3,
+    n_juries: int = 5
+) -> Tuple[List[str], Tuple[int, int], dict]:
+    """Synchronous wrapper for MORE debate with D3 enhancements."""
     loop = asyncio.get_event_loop()
-    return loop.run_until_complete(run_debate(question, answer1, answer2, investment, n_round, n_advocates))
+    return loop.run_until_complete(run_debate(
+        question, answer1, answer2, investment, n_round, n_advocates, n_juries
+    ))

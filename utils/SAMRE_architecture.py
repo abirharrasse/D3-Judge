@@ -1,14 +1,19 @@
 import asyncio
 import nest_asyncio
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from metagpt.actions import Action
 from metagpt.logs import logger
 from metagpt.roles import Role
 from metagpt.schema import Message
 import argparse
 
-print("Starting improved debate script...")
+# D3 Framework enhancements
+from convergence import BudgetedStoppingController, BudgetConfig, check_convergence
+from anonymizer import TranscriptBuilder, anonymize_transcript
+from token_tracker import TokenTracker, get_global_tracker
+
+print("Starting improved debate script with D3 enhancements...")
 
 def print_memory(role):
     print(f"\n--- Memory for {role.name} ---")
@@ -238,8 +243,38 @@ class Jury(Role):
         self.rc.memory.add(msg_memory)
         return msg
 
-async def enhanced_debate(question:str, answer1:str, answer2:str, investment: float = 3.0, max_rounds: int = 7, n_juries: int = 5) -> Tuple[List[str], Tuple[int, int]]:
-    print("Initializing enhanced debate...")
+async def enhanced_debate(
+    question: str, 
+    answer1: str, 
+    answer2: str, 
+    investment: float = 3.0, 
+    max_rounds: int = 7, 
+    n_juries: int = 5,
+    max_tokens: int = 10000,
+    convergence_epsilon: float = 5.0
+) -> Tuple[List[str], Tuple[int, int], dict]:
+    """
+    Enhanced debate with D3 framework features:
+    - Budgeted stopping (convergence + token limits)
+    - Anonymized transcripts for jury
+    - Token tracking
+    
+    Returns:
+        Tuple of (scores_list, jury_votes, stats_dict)
+    """
+    print("Initializing enhanced debate with D3 framework...")
+    
+    # Initialize D3 components
+    budget_controller = BudgetedStoppingController(
+        BudgetConfig(
+            max_rounds=max_rounds,
+            max_tokens=max_tokens,
+            convergence_epsilon=convergence_epsilon
+        )
+    )
+    transcript_builder = TranscriptBuilder(question, answer1, answer2)
+    token_tracker = TokenTracker()
+    
     advocate1 = EnhancedAdvocate(name="Advocate1", question=question, answer=answer1, opponent_answer=answer2)
     advocate2 = EnhancedAdvocate(name="Advocate2", question=question, answer=answer2, opponent_answer=answer1)
     judge = EnhancedJudge(question=question, answer1=answer1, answer2=answer2)
@@ -262,39 +297,43 @@ async def enhanced_debate(question:str, answer1:str, answer2:str, investment: fl
     print(f"Debate Question: {question}")
     print(f"Advocate1 defends: {answer1}")
     print(f"Advocate2 defends: {answer2}")
-    print(f"Number of juries: {n_juries}\n")
+    print(f"Number of juries: {n_juries}")
+    print(f"Budgeted stopping enabled: max_rounds={max_rounds}, max_tokens={max_tokens}\n")
 
     initial_msg = Message(content=question, role="Human", cause_by=DefendAnswer)
     advocate1.rc.memory.add(initial_msg)
 
     previous_scores = []
     scores = []
+    stop_reason = ""
 
     round_count = 0
-    while round_count < max_rounds:
+    # Budgeted stopping loop - check BEFORE running each round
+    should_stop, stop_reason = budget_controller.should_stop()
+    while not should_stop:
         round_count += 1
+        token_tracker.set_round(round_count)
         print(f"\nStarting Round {round_count}...")
 
         print("Advocate1 preparing argument...")
         msg1 = await advocate1._act()
+        # Track in transcript builder
+        transcript_builder.add_argument("Advocate1", msg1.content)
         advocate2.rc.memory.add(Message(content=msg1.content, role="Opponent of Advocate2", cause_by=DefendAnswer))
         judge.rc.memory.add(Message(content=msg1.content, role="Advocate1", cause_by=DefendAnswer))
-        for jury in juries:
-            jury.rc.memory.add(Message(content=msg1.content, role="Advocate1", cause_by=DefendAnswer))
+        # Note: Jury gets anonymized transcript at the end, not during debate
 
         print("Advocate2 preparing argument...")
         msg2 = await advocate2._act()
+        # Track in transcript builder
+        transcript_builder.add_argument("Advocate2", msg2.content)
         advocate1.rc.memory.add(Message(content=msg2.content, role="Opponent of Advocate1", cause_by=DefendAnswer))
         judge.rc.memory.add(Message(content=msg2.content, role="Advocate2", cause_by=DefendAnswer))
-        for jury in juries:
-            jury.rc.memory.add(Message(content=msg2.content, role="Advocate2", cause_by=DefendAnswer))
 
         print("Judge evaluating...")
         judge_msg = await judge._act(current_round=round_count, max_rounds=max_rounds, previous_scores=previous_scores)
         advocate1.rc.memory.add(Message(content=judge_msg.content, role="Judge", cause_by=EnhancedJudgeAnswer))
         advocate2.rc.memory.add(Message(content=judge_msg.content, role="Judge", cause_by=EnhancedJudgeAnswer))
-        for jury in juries:
-            jury.rc.memory.add(Message(content=judge_msg.content, role="Judge", cause_by=EnhancedJudgeAnswer))
 
         score_match = get_last_tuple(judge_msg.content)
         print("______________________last_tuples", score_match)
@@ -302,16 +341,36 @@ async def enhanced_debate(question:str, answer1:str, answer2:str, investment: fl
             new_scores = score_match
             previous_scores.append(new_scores)
             scores.append(str(new_scores))
+            # Track in transcript builder and budget controller
+            transcript_builder.add_judge_round(judge_msg.content, new_scores)
+            budget_controller.record_round(new_scores, tokens_used=0)  # TODO: integrate actual token count
             print(f"Parsed Scores: {new_scores}")
         else:
             print("Error parsing scores from judge's message")
             previous_scores.append((0, 0))
             scores.append("(0, 0)")
+            budget_controller.record_round((0, 0), tokens_used=0)
+        
+        # Check budgeted stopping after each round
+        should_stop, stop_reason = budget_controller.should_stop()
+        if should_stop:
+            print(f"\n*** Budgeted stopping triggered: {stop_reason} ***")
+            break
 
-    # Jury voting
+    # Jury voting with ANONYMIZED transcript
+    print("\nCompiling anonymized transcript for jury deliberation...")
+    anonymized_transcript = transcript_builder.build_anonymized()
+    print(f"Transcript compiled ({len(anonymized_transcript)} chars)")
+    
     print("Jury voting...")
     jury_votes_list = []
     for jury in juries:
+        # Provide anonymized transcript to jury
+        jury.rc.memory.add(Message(
+            content=f"ANONYMIZED DEBATE TRANSCRIPT:\n{anonymized_transcript}",
+            role="Transcript",
+            cause_by=EnhancedJudgeAnswer
+        ))
         jury_vote = await jury._act()
         score_jury = get_last_tuple(jury_vote.content)
         parsed_jury = score_jury if score_jury else (0, 0)
@@ -327,26 +386,72 @@ async def enhanced_debate(question:str, answer1:str, answer2:str, investment: fl
     for round_num, score in enumerate(scores, 1):
         print(f"Round {round_num}: {score}")
 
-    jury_winner = "Advocate1" if jury_votes[0] > jury_votes[1] else "Advocate2"
+    jury_winner = "Defense A" if jury_votes[0] > jury_votes[1] else "Defense B"
     print(f"\nDebate completed.")
-    print(f"Judge's Final Scores: {previous_scores[-1]}")
-    print(f"Jury Votes: Advocate1: {jury_votes[0]}, Advocate2: {jury_votes[1]}")
+    if previous_scores:
+        print(f"Judge's Final Scores: {previous_scores[-1]}")
+    print(f"Jury Votes: Defense A: {jury_votes[0]}, Defense B: {jury_votes[1]}")
     print(f"Jury's Winner: {jury_winner}")
+    if stop_reason:
+        print(f"Stop reason: {stop_reason}")
+    
+    # Compile statistics
+    stats = {
+        "rounds_completed": round_count,
+        "stop_reason": stop_reason,
+        "token_usage": token_tracker.get_summary(),
+        "budget_stats": budget_controller.get_stats()
+    }
 
-    return scores, tuple(jury_votes)
+    return scores, tuple(jury_votes), stats
 
-async def run_debate(question: str, answer1: str, answer2: str, investment: float = 0.1, max_rounds: int = 7, n_juries: int = 5) -> Tuple[List[str], Tuple[int, int]]:
+async def run_debate(
+    question: str, 
+    answer1: str, 
+    answer2: str, 
+    investment: float = 0.1, 
+    max_rounds: int = 7, 
+    n_juries: int = 5,
+    max_tokens: int = 10000,
+    convergence_epsilon: float = 5.0
+) -> Tuple[List[str], Tuple[int, int], dict]:
+    """Run a SAMRE debate with D3 framework enhancements."""
     try:
-        print("Starting run_debate function...")
-        scores, juries = await enhanced_debate(question=question, answer1=answer1, answer2=answer2, investment=investment, max_rounds=max_rounds, n_juries=n_juries)
+        print("Starting run_debate function with D3 enhancements...")
+        scores, juries, stats = await enhanced_debate(
+            question=question, 
+            answer1=answer1, 
+            answer2=answer2, 
+            investment=investment, 
+            max_rounds=max_rounds, 
+            n_juries=n_juries,
+            max_tokens=max_tokens,
+            convergence_epsilon=convergence_epsilon
+        )
         print("Debate completed successfully.")
-        return scores, juries
+        print(f"Stats: {stats}")
+        return scores, juries, stats
     except Exception as e:
         print(f"An error occurred during the debate: {str(e)}")
         import traceback
         traceback.print_exc()
-        return [], (0,0)
+        return [], (0, 0), {"error": str(e)}
 
-def samre_scores(question: str, answer1: str, answer2: str, investment: float = 0.1, max_rounds: int = 7, n_juries: int = 5) -> Tuple[List[str], Tuple[int, int]]:
+
+def samre_scores(
+    question: str, 
+    answer1: str, 
+    answer2: str, 
+    investment: float = 0.1, 
+    max_rounds: int = 7, 
+    n_juries: int = 5,
+    max_tokens: int = 10000,
+    convergence_epsilon: float = 5.0
+) -> Tuple[List[str], Tuple[int, int], dict]:
+    """Synchronous wrapper for SAMRE debate with D3 enhancements."""
+    nest_asyncio.apply()
     loop = asyncio.get_event_loop()
-    return loop.run_until_complete(run_debate(question, answer1, answer2, investment, max_rounds, n_juries))
+    return loop.run_until_complete(run_debate(
+        question, answer1, answer2, investment, max_rounds, n_juries,
+        max_tokens, convergence_epsilon
+    ))
