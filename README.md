@@ -4,30 +4,19 @@
   <img src="images/main_figure.jpg" alt="Architectures Diagram" width="90%" />
 </p>
 
-## Background
-As large language models (LLMs) evolve, evaluating their outputs becomes increasingly complex. Traditional methods, such as human assessments, are often costly and inconsistent, while automated metrics may fail to capture the nuances of LLM performance.
+## Overview
 
-To address these challenges, we propose a novel framework that uses LLMs as **advocates** in a dynamic, **courtroom-inspired** system. This approach involves LLMs acting as advocates, judges, and juries to provide a comprehensive evaluation of model outputs.
+LLM evaluation faces a fundamental challenge: while human assessment remains the gold standard, it is prohibitively expensive and slow. Single-judge LLM evaluation scales but suffers from well-documented biases—positional bias, verbosity bias, and self-enhancement—that compromise reliability. Existing multi-agent approaches add complexity without principled cost-awareness or theoretical grounding.
 
-This framework integrates decision theory, bounded rationality, and economic incentives to offer a robust evaluation method. Subsequent sections will detail the architecture and experiments validating its effectiveness.
+D3 addresses this gap through a **courtroom-inspired multi-agent framework** where role-specialized agents (advocates, judge, jury) engage in structured adversarial debate to produce reliable, interpretable, and cost-efficient evaluations. The framework combines three key innovations:
+
+1. **Structured debate protocols**: Dual evaluation modes (MORE for efficiency, SAMRE for depth) with explicit cost-accuracy trade-offs
+2. **Theoretical grounding**: Probabilistic convergence guarantees and formal justification for multi-advocate signal amplification
+3. **Budgeted stopping**: Automated debate termination based on convergence criteria, reducing token consumption by 40% without sacrificing accuracy
+
+Validated across MT-Bench, AlignBench, and AUTO-J, D3 achieves 86.3% accuracy—a 12.6% absolute improvement over single-judge evaluation and 6.9% over the best existing framework—while providing full interpretability through debate transcripts and reasoned jury verdicts.
 
 
-
-## Data
-
-### Dataset
-
-This project uses the `lmsys/mt_bench_human_judgments` dataset from Hugging Face.
-
-### Preprocessing
-
-The script `src/preprocess_mt_bench.py` processes the raw data into an Excel file (`data/mt_bench_human_judgments.xlsx`) with the following columns:
-
-- **Question**: Aggregated user questions.
-- **Response_A**: Responses from Model A.
-- **Response_B**: Responses from Model B.
-- **Model_A_Score**: Binary score for Model A (1 for a win, 0 for a loss).
-- **Model_B_Score**: Binary score for Model B (1 for a win, 0 for a loss).
 
 Run the preprocessing with:
 ```bash
@@ -74,55 +63,74 @@ os.environ['CLAUDE_API_KEY'] = ''
 os.environ['GEMINI_API_KEY'] = ''
 os.environ['COHERE_API_KEY'] = ''
 ```
-## Running the evaluation architectures
 
-#### Single Advocate Multi-Round Evaluation (SAMRE): 
-To run the **SAMRE** evaluation framework:
-Begin by accessing the directory `LLM_Judging_Architectures`:
-```bash
-import os
-os.chdir('/content/LLM_Judging_Architectures')
-print(os.getcwd())
+## Quick Start
+
+```python
+from utils.arch_builder import samre_arch, more_arch
+
+# Run SAMRE evaluation
+scores, jury_votes, stats = samre_arch(
+    model="gpt-4o",
+    temp=0.7,
+    question="Which response is more helpful?",
+    answer1="First answer...",
+    answer2="Second answer...",
+    investment=0.1,
+    n_rounds=5,
+    n_juries=5
+)
+
+# Run MORE evaluation
+scores, jury_votes, stats = more_arch(
+    model="gpt-4o",
+    temperature=0.7,
+    question="Which is better?",
+    answer1="Answer A",
+    answer2="Answer B",
+    n_advocates=3,
+    investment=0.1,
+    n_rounds=1,
+    n_juries=5
+)
 ```
-then call the `samre_experiment` function with the appropriate parameters: 
-```bash
-! python utils/experiments.py --experiment samre --model_pl "mistral" --temperature 0.7 --question "What is the impact of AI on healthcare?" --answer1 "AI can improve diagnostic accuracy." --answer2 "AI might introduce bias in diagnosis." --investment 0.1 --n_rounds 4 --n_juries 3
+
+## Key Features
+
+- **Budgeted Stopping**: 58% of debates converge by round 2 (mean 2.71 rounds)
+- **Anonymization**: Jury receives anonymized transcripts to prevent bias
+- **50 Personas**: Diverse jury pool across law, medicine, tech, ethics, etc.
+- **Multi-Benchmark**: Support for MT-Bench, AlignBench, AUTO-J
+
+
+## Project Structure
 
 ```
-Where:
+utils/
+├── SAMRE_architecture.py   # Single-Advocate Multi-Round with budgeted stopping
+├── MORE_architecture.py    # Multi-Advocate One-Round evaluation
+├── arch_builder.py         # High-level protocol wrappers
+├── convergence.py          # Budgeted stopping + convergence detection
+├── token_tracker.py        # Cost/token tracking
+├── anonymizer.py           # Transcript anonymization for jury
+├── metrics.py              # Cohen's Kappa, positional swap, self-enhancement
+├── personas.py             # 50-persona pool across 9 domains
 
-- **model**: Select one of the models supported by our framework, accessible via Together or OpenAI.
-- **question**: The question to which answer1 and answer2 respond.
-- **answer1** and **answer2**: The answers to be evaluated.
-- **investment**: The maximum cost allocated for the experiment.
-- **n_rounds**: The number of evaluation rounds to conduct.
-- **n_juries**: The number of juries involved in the evaluation.
-
-
-
-#### Multi-Advocate One-Round Evaluation (MORE) 
-
-To run the **MORE** evaluation framework:
-Begin by accessing the directory `LLM_Judging_Architectures`:
-```bash
-import os
-os.chdir('/content/LLM_Judging_Architectures')
-print(os.getcwd())
+data/
+└── benchmark_loader.py             # MT-Bench/AlignBench/AUTO-J loaders
 ```
-then call the `more_experiment` function with the appropriate parameters: 
-```bash
-! python utils/experiments.py --experiment more --model_pl "mistral" --temperature 0.7 --question "How does AI influence education?" --answer1 "AI personalizes learning." --answer2 "AI could limit creativity." --n_advocates 2 --investment 3  --n_rounds 1
 
 
-```
-Where:
-- **n_advocates**: The number of advocates involved in the evaluation.
-- **n_rounds**: The number of evaluation rounds to conduct.
+## Citation
 
-
-## Full Dataset Evaluation
-
-To execute our architectures on the entire `mt-bench` dataset and ompare it to the `basemodel.py`, use the following code:
-```bash
-!python utils/main.py
+```bibtex
+@misc{harrasse2025debatedeliberatedecided3,
+      title={Debate, Deliberate, Decide (D3): A Cost-Aware Adversarial Framework for Reliable and Interpretable LLM Evaluation}, 
+      author={Abir Harrasse and Chaithanya Bandi and Hari Bandi},
+      year={2025},
+      eprint={2410.04663},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2410.04663}, 
+}
 ```
