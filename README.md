@@ -1,7 +1,7 @@
 # LLM-Based-Judging-Architectures
 
 <p align="center">
-  <img src="images/architecture.png" alt="Architectures Diagram" width="90%" />
+  <img src="images/main_figure.jpg" alt="Architectures Diagram" width="90%" />
 </p>
 
 ## Background
